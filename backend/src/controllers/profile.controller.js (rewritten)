@@ -1,0 +1,54 @@
+const Profile = require('../models/profile.model')
+
+// helper to ensure we never overwrite the user field from the client
+const sanitizeIncoming = (body) => {
+  const clone = { ...body }
+  delete clone.user
+  return clone
+}
+
+const getMyProfile = async (req, res) => {
+  try {
+    const profile = await Profile.findOne({ user: req.user.sub })
+    if (!profile) {
+      return res.status(404).json({ message: 'Profile not found' })
+    }
+    return res.json({ profile })
+  } catch (err) {
+    console.error('Profile fetch error:', err)
+    return res.status(500).json({ message: 'Server error' })
+  }
+}
+
+const upsertMyProfile = async (req, res) => {
+  try {
+    const data = sanitizeIncoming(req.body)
+    const profile = await Profile.findOneAndUpdate(
+      { user: req.user.sub },
+      { $set: { ...data, user: req.user.sub } },
+      { new: true, upsert: true, runValidators: true },
+    )
+
+    return res.json({ profile })
+  } catch (err) {
+    console.error('Profile upsert error:', err)
+    return res.status(400).json({ message: err.message || 'Invalid data' })
+  }
+}
+
+const getPublicProfile = async (req, res) => {
+  try {
+    const { userId } = req.params
+    const query = userId ? { user: userId } : {}
+    const profile = await Profile.findOne(query).populate('user', 'fullName email')
+    if (!profile) {
+      return res.status(404).json({ message: 'Profile not found' })
+    }
+    return res.json({ profile })
+  } catch (err) {
+    console.error('Public profile error:', err)
+    return res.status(500).json({ message: 'Server error' })
+  }
+}
+
+module.exports = { getMyProfile, upsertMyProfile, getPublicProfile }
