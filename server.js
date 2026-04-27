@@ -14,20 +14,51 @@ const projectRoutes = require("./src/routes/project.routes");
 
 const app = express();
 
-// ✅ FULL CORS CONFIG
-app.use(
-  cors({
-    origin: [
-      // process.env.WEBSITE_URL,
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://localhost:5175",
-    ],
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  }),
-);
+const normalizeOrigin = (value = "") =>
+  value
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/\/$/, "");
+const configuredOrigins = `${process.env.ALLOWED_ORIGINS || ""},${process.env.WEBSITE_URL || ""}`
+  .split(",")
+  .map(normalizeOrigin)
+  .filter(Boolean);
+
+const defaultAllowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:5175",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500",
+];
+
+const allowAllOrigins = configuredOrigins.includes("*");
+const allowedOrigins = new Set([
+  ...defaultAllowedOrigins.map(normalizeOrigin),
+  ...configuredOrigins.filter((origin) => origin !== "*"),
+]);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+
+    const normalizedRequestOrigin = normalizeOrigin(origin);
+    if (allowAllOrigins || allowedOrigins.has(normalizedRequestOrigin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 // Allow slightly larger JSON payloads to support gallery/base64 uploads from admin
 app.use(express.json({ limit: '15mb' }));
 
