@@ -70,7 +70,31 @@ const getOwnerConsultations = async (req, res) => {
   }
 }
 
+const deleteOwnerConsultation = async (req, res) => {
+  if (!hasOwnerAccess(req)) {
+    return res.status(403).json({ message: 'Only owner/admin can delete consultations' })
+  }
+
+  try {
+    const consultationId = String(req.params?.consultationId || '').trim()
+    if (!consultationId) {
+      return res.status(400).json({ message: 'Consultation id is required' })
+    }
+
+    const deleted = await Consultation.findByIdAndDelete(consultationId)
+    if (!deleted) {
+      return res.status(404).json({ message: 'Consultation not found' })
+    }
+
+    return res.json({ success: true, consultationId })
+  } catch (err) {
+    console.error('Consultation delete error:', err)
+    return res.status(500).json({ message: 'Server error' })
+  }
+}
+
 module.exports = {
   createConsultation,
   getOwnerConsultations,
+  deleteOwnerConsultation,
 }

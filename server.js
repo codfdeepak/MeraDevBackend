@@ -11,6 +11,7 @@ const serviceRoutes = require("./src/routes/service.routes");
 const consultationRoutes = require("./src/routes/consultation.routes");
 const heroRoutes = require("./src/routes/hero.routes");
 const projectRoutes = require("./src/routes/project.routes");
+const analyticsRoutes = require("./src/routes/analytics.routes");
 
 const app = express();
 
@@ -72,6 +73,7 @@ app.use("/api/services", serviceRoutes);
 app.use("/api/consultations", consultationRoutes);
 app.use("/api/hero", heroRoutes);
 app.use("/api/projects", projectRoutes);
+app.use("/api/analytics", analyticsRoutes);
 
 const PORT = process.env.PORT || 5000;
 

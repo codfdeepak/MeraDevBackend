@@ -4,6 +4,8 @@ const {
   login,
   me,
   updateMe,
+  getMyPasswordMeta,
+  updateMyPassword,
   listUsers,
   updateUserStatus,
   updateUserApproval,
@@ -18,6 +20,8 @@ router.post("/signup", register);
 router.post("/login", login);
 router.get("/me", authMiddleware, me);
 router.patch("/me", authMiddleware, updateMe);
+router.get("/me/password-meta", authMiddleware, getMyPasswordMeta);
+router.patch("/me/password", authMiddleware, updateMyPassword);
 router.get("/users", authMiddleware, listUsers);
 router.patch("/users/:userId/status", authMiddleware, updateUserStatus);
 router.patch("/users/:userId/approval", authMiddleware, updateUserApproval);

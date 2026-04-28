@@ -178,6 +178,73 @@ const updateMe = async (req, res) => {
   }
 };
 
+const getMyPasswordMeta = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.sub).select("password");
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.json({
+      hasPassword: Boolean(user.password),
+      maskedPassword: user.password ? "********" : "",
+      revealSupported: false,
+      note: "Current password cannot be shown for security reasons.",
+    });
+  } catch (err) {
+    console.error("Get password meta error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
+const updateMyPassword = async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || "");
+    const newPassword = String(req.body?.newPassword || "");
+    const confirmPassword = String(req.body?.confirmPassword || "");
+
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res
+        .status(400)
+        .json({ message: "Current password, new password, and confirm password are required" });
+    }
+
+    if (newPassword.length < 8) {
+      return res
+        .status(400)
+        .json({ message: "New password must be at least 8 characters" });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "Confirm password does not match" });
+    }
+
+    if (currentPassword === newPassword) {
+      return res
+        .status(400)
+        .json({ message: "New password must be different from current password" });
+    }
+
+    const user = await User.findById(req.user.sub);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const isCurrentMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isCurrentMatch) {
+      return res.status(401).json({ message: "Current password is incorrect" });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    return res.json({ success: true, message: "Password updated successfully" });
+  } catch (err) {
+    console.error("Update my password error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
 const listUsers = async (req, res) => {
   try {
     if (denyIfNotOwner(req, res)) return;
@@ -334,6 +401,8 @@ module.exports = {
   login,
   me,
   updateMe,
+  getMyPasswordMeta,
+  updateMyPassword,
   listUsers,
   updateUserStatus,
   updateUserApproval,
