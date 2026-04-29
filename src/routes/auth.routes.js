@@ -9,6 +9,7 @@ const {
   listUsers,
   updateUserStatus,
   updateUserApproval,
+  updateUserFeatureAccess,
   resetUserPassword,
   deleteUser,
 } = require("../controllers/auth.controller");
@@ -25,6 +26,7 @@ router.patch("/me/password", authMiddleware, updateMyPassword);
 router.get("/users", authMiddleware, listUsers);
 router.patch("/users/:userId/status", authMiddleware, updateUserStatus);
 router.patch("/users/:userId/approval", authMiddleware, updateUserApproval);
+router.patch("/users/:userId/features", authMiddleware, updateUserFeatureAccess);
 router.patch("/users/:userId/password", authMiddleware, resetUserPassword);
 router.delete("/users/:userId", authMiddleware, deleteUser);
 

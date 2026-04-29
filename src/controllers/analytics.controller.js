@@ -1,4 +1,8 @@
 const AnalyticsEvent = require("../models/analyticsEvent.model");
+const User = require("../models/user.model");
+const http = require("http");
+const https = require("https");
+const net = require("net");
 
 const EVENT_TYPES = new Set([
   "page_view",
@@ -24,6 +28,55 @@ const MAX_VISITOR_OVERVIEW = 220;
 const MAX_VISITOR_PREVIEW_ACTIVITIES = 8;
 const MAX_VISITOR_JOURNEY_ACTIVITIES = 450;
 const MAX_PAGE_SEQUENCE_ITEMS = 140;
+const GEO_LOOKUP_TIMEOUT_MS = 1800;
+const GEO_LOOKUP_CACHE_TTL_MS = 12 * HOUR_MS;
+const GEO_LOOKUP_CACHE_MAX = 3000;
+const GEO_LOOKUP_ENABLED =
+  String(process.env.ANALYTICS_IP_GEO_ENABLED || "").trim().toLowerCase() !== "false";
+const GEO_LOOKUP_URL_BUILDERS = [
+  (ip) =>
+    `https://ipwho.is/${encodeURIComponent(
+      ip,
+    )}?fields=success,country,country_code,region,city,timezone,message`,
+  (ip) => `https://ipapi.co/${encodeURIComponent(ip)}/json/`,
+];
+
+const timezoneCountryHintMap = {
+  "Asia/Kolkata": "IN",
+  "Asia/Calcutta": "IN",
+  "Asia/Dubai": "AE",
+  "Asia/Karachi": "PK",
+  "Asia/Dhaka": "BD",
+  "Asia/Colombo": "LK",
+  "Asia/Kathmandu": "NP",
+  "Asia/Thimphu": "BT",
+  "Asia/Kabul": "AF",
+  "Asia/Yangon": "MM",
+  "Asia/Bangkok": "TH",
+  "Asia/Singapore": "SG",
+  "Asia/Jakarta": "ID",
+  "Asia/Manila": "PH",
+  "Asia/Tokyo": "JP",
+  "Asia/Seoul": "KR",
+  "Asia/Shanghai": "CN",
+  "Asia/Hong_Kong": "HK",
+  "Asia/Jerusalem": "IL",
+  "Europe/London": "GB",
+  "Europe/Paris": "FR",
+  "Europe/Berlin": "DE",
+  "Australia/Sydney": "AU",
+  "Pacific/Auckland": "NZ",
+};
+
+const emptyGeoLocation = Object.freeze({
+  city: "",
+  region: "",
+  country: "",
+  timezone: "",
+});
+const ipGeoCache = new Map();
+const inFlightIpGeoLookup = new Map();
+const displayNameFormatters = new Map();
 
 const normalizeText = (value, maxLength = 200) =>
   String(value || "")
@@ -44,9 +97,32 @@ const parseOptionalDate = (value) => {
   return parsed;
 };
 
-const hasOwnerAccess = (req) => {
-  const role = normalizeText(req?.user?.role, 20).toLowerCase();
-  return role === "owner";
+const hasWebAnalyticsAccess = (user) => {
+  const role = normalizeText(user?.role, 20).toLowerCase();
+  if (role === "owner") return true;
+  if (user?.isActive === false) return false;
+  const approvalStatus = normalizeText(user?.approvalStatus, 20).toLowerCase();
+  if (approvalStatus && approvalStatus !== "approved") return false;
+  return Boolean(user?.featureAccess?.webAnalytics);
+};
+
+const ensureAnalyticsAccess = async (req, res) => {
+  const requesterId = normalizeText(req?.user?.sub, 120);
+  if (!requesterId) {
+    res.status(401).json({ message: "Unauthorized" });
+    return null;
+  }
+
+  const user = await User.findById(requesterId)
+    .select("role isActive approvalStatus featureAccess")
+    .lean();
+
+  if (!user || !hasWebAnalyticsAccess(user)) {
+    res.status(403).json({ message: "You do not have web analytics access" });
+    return null;
+  }
+
+  return user;
 };
 
 const toSerializableMetadata = (value) => {
@@ -265,10 +341,42 @@ const humanizeSlug = (slug) =>
     .trim()
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
-const getPathDescriptor = (path, metadata = {}) => {
+const extractPartnerUserIdFromPath = (path) => {
+  const pathname = normalizePathname(path);
+  if (!pathname.startsWith("/profile/")) return "";
+  return normalizeText(pathname.split("/")[2], 120);
+};
+
+const isMongoObjectId = (value) => /^[a-f0-9]{24}$/i.test(normalizeText(value, 40));
+
+const resolvePartnerNameByUserId = async (events = []) => {
+  const userIds = [
+    ...new Set(
+      events
+        .map((event) => extractPartnerUserIdFromPath(event?.path))
+        .filter((id) => isMongoObjectId(id)),
+    ),
+  ];
+
+  if (!userIds.length) return {};
+
+  const users = await User.find({ _id: { $in: userIds } })
+    .select("_id fullName")
+    .lean();
+
+  return users.reduce((acc, user) => {
+    const id = normalizeText(user?._id, 120);
+    const fullName = normalizeText(user?.fullName, 140);
+    if (id && fullName) acc[id] = fullName;
+    return acc;
+  }, {});
+};
+
+const getPathDescriptor = (path, metadata = {}, options = {}) => {
   const routeKey = normalizeText(metadata?.routeKey, 60).toLowerCase();
   const route = normalizePathname(metadata?.route || path);
   const pathname = route || normalizePathname(path);
+  const partnerNameByUserId = options?.partnerNameByUserId || {};
 
   if (!pathname || pathname === "/") {
     return {
@@ -328,7 +436,17 @@ const getPathDescriptor = (path, metadata = {}) => {
   if (pathname === "/enquiry") return { path: pathname, label: "Enquiry Page" };
   if (pathname === "/technologies") return { path: pathname, label: "Technologies Page" };
   if (pathname === "/payment-policy") return { path: pathname, label: "Payment Policy Page" };
-  if (pathname.startsWith("/profile/")) return { path: pathname, label: "Partner Profile Page" };
+  if (pathname.startsWith("/profile/")) {
+    const partnerUserId = extractPartnerUserIdFromPath(pathname);
+    const partnerName = normalizeText(
+      metadata?.partnerName || partnerNameByUserId?.[partnerUserId],
+      140,
+    );
+    if (partnerName) {
+      return { path: pathname, label: `Partner Profile: ${partnerName}` };
+    }
+    return { path: pathname, label: "Partner Profile Page" };
+  }
 
   return {
     path: pathname,
@@ -352,6 +470,7 @@ const pickActivityMetadata = (metadata) => {
     serviceId: normalizeText(source.serviceId, 100),
     serviceName: normalizeText(source.serviceName, 160),
     categoryKey: normalizeText(source.categoryKey, 120),
+    partnerName: normalizeText(source.partnerName, 140),
     title: normalizeText(source.title, 160),
   };
 };
@@ -363,8 +482,9 @@ const buildActivityLabel = ({
   action,
   label,
   metadata,
+  descriptorOptions = {},
 }) => {
-  const descriptor = getPathDescriptor(path, metadata);
+  const descriptor = getPathDescriptor(path, metadata, descriptorOptions);
   const safeAction = normalizeText(action, 120);
   const safeLabel = normalizeText(label, 160);
 
@@ -386,7 +506,11 @@ const buildActivityLabel = ({
     const clickText = safeLabel || safeAction || "element";
     const destinationPath = normalizeInternalHref(metadata?.href);
     if (destinationPath) {
-      const destination = getPathDescriptor(destinationPath, metadata);
+      const destination = getPathDescriptor(
+        destinationPath,
+        metadata,
+        descriptorOptions,
+      );
       return `Clicked \"${clickText}\" and opened ${destination.label}`;
     }
     return `Clicked \"${clickText}\" on ${descriptor.label}`;
@@ -419,7 +543,7 @@ const buildActivityLabel = ({
   return `Activity on ${descriptor.label}`;
 };
 
-const buildActivityEntry = (event) => {
+const buildActivityEntry = (event, descriptorOptions = {}) => {
   const eventType = normalizeEventType(event.eventType);
   const status = normalizeStatus(event.status);
   const path = normalizePath(event.path);
@@ -435,6 +559,7 @@ const buildActivityEntry = (event) => {
     action,
     label,
     metadata,
+    descriptorOptions,
   });
 
   if (!activityLabel) return null;
@@ -447,7 +572,7 @@ const buildActivityEntry = (event) => {
     action,
     label,
     activityLabel,
-    pageLabel: getPathDescriptor(path, metadata).label,
+    pageLabel: getPathDescriptor(path, metadata, descriptorOptions).label,
     metadata,
   };
 };
@@ -483,8 +608,455 @@ const toTopList = (entries, keyName, limit = 10) =>
     .slice(0, limit)
     .map(([key, count]) => ({ [keyName]: key, count }));
 
-const mapIncomingEvent = (rawEvent, req) => {
+const pickFirstNonEmpty = (...values) =>
+  values
+    .map((value) => normalizeText(value, 80))
+    .find(Boolean) || "";
+
+const normalizeCountry = (value) => {
+  const safe = normalizeText(value, 80);
+  if (/^[a-z]{2}$/i.test(safe)) return safe.toUpperCase();
+  return safe;
+};
+
+const toCountryDisplayName = (value) => {
+  const normalized = normalizeCountry(value);
+  if (!/^[A-Z]{2}$/.test(normalized)) return normalized;
+
+  if (!displayNameFormatters.has("region")) {
+    try {
+      displayNameFormatters.set(
+        "region",
+        new Intl.DisplayNames(["en"], { type: "region" }),
+      );
+    } catch (_error) {
+      displayNameFormatters.set("region", null);
+    }
+  }
+
+  const formatter = displayNameFormatters.get("region");
+  if (!formatter || typeof formatter.of !== "function") return normalized;
+  return normalizeText(formatter.of(normalized), 80) || normalized;
+};
+
+const normalizeTimezoneHint = (value) => {
+  const safe = normalizeText(value, 80);
+  if (!safe) return "";
+  try {
+    new Intl.DateTimeFormat("en-IN", { timeZone: safe }).format(new Date());
+    return safe;
+  } catch (_error) {
+    return "";
+  }
+};
+
+const sanitizeIpCandidate = (value) => {
+  let safe = normalizeText(value, 120);
+  if (!safe) return "";
+
+  if (safe.includes(",")) {
+    safe = normalizeText(safe.split(",")[0], 120);
+  }
+
+  safe = safe.replace(/^\[|\]$/g, "");
+  if (safe.startsWith("::ffff:")) {
+    safe = safe.slice(7);
+  }
+
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(safe)) {
+    safe = safe.split(":")[0];
+  }
+
+  return normalizeText(safe, 80);
+};
+
+const isPrivateOrLoopbackIp = (ip) => {
+  const safe = sanitizeIpCandidate(ip);
+  const family = net.isIP(safe);
+  if (!family) return true;
+
+  if (family === 4) {
+    const octets = safe.split(".").map((part) => Number(part));
+    if (octets.length !== 4 || octets.some((item) => !Number.isInteger(item))) return true;
+    const [first, second] = octets;
+    if (first === 10) return true;
+    if (first === 127) return true;
+    if (first === 0) return true;
+    if (first === 169 && second === 254) return true;
+    if (first === 192 && second === 168) return true;
+    if (first === 172 && second >= 16 && second <= 31) return true;
+    if (first === 100 && second >= 64 && second <= 127) return true;
+    return false;
+  }
+
+  const lowered = safe.toLowerCase();
+  return (
+    lowered === "::1" ||
+    lowered.startsWith("fe80:") ||
+    lowered.startsWith("fc") ||
+    lowered.startsWith("fd")
+  );
+};
+
+const extractClientIp = (req) => {
+  const rawCandidates = [
+    req.get("cf-connecting-ip"),
+    req.get("x-real-ip"),
+    req.get("x-forwarded-for"),
+    req.get("x-client-ip"),
+    req.get("fly-client-ip"),
+    req.get("x-vercel-forwarded-for"),
+    req.ip,
+    req.socket?.remoteAddress,
+    req.connection?.remoteAddress,
+  ];
+
+  const candidates = [];
+  rawCandidates.forEach((raw) => {
+    const values = String(raw || "")
+      .split(",")
+      .map((item) => sanitizeIpCandidate(item))
+      .filter(Boolean);
+    candidates.push(...values);
+  });
+
+  const unique = [...new Set(candidates)];
+  const publicIp = unique.find((ip) => net.isIP(ip) && !isPrivateOrLoopbackIp(ip));
+  if (publicIp) return publicIp;
+  return unique.find((ip) => net.isIP(ip)) || "";
+};
+
+const readCachedGeoLocation = (ip) => {
+  const safeIp = sanitizeIpCandidate(ip);
+  if (!safeIp) return null;
+  const cached = ipGeoCache.get(safeIp);
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    ipGeoCache.delete(safeIp);
+    return null;
+  }
+
+  return {
+    ...emptyGeoLocation,
+    ...(cached.location || {}),
+  };
+};
+
+const writeCachedGeoLocation = (ip, location = emptyGeoLocation) => {
+  const safeIp = sanitizeIpCandidate(ip);
+  if (!safeIp) return;
+
+  if (ipGeoCache.size >= GEO_LOOKUP_CACHE_MAX) {
+    const oldestKey = ipGeoCache.keys().next().value;
+    if (oldestKey) ipGeoCache.delete(oldestKey);
+  }
+
+  ipGeoCache.set(safeIp, {
+    expiresAt: Date.now() + GEO_LOOKUP_CACHE_TTL_MS,
+    location: {
+      ...emptyGeoLocation,
+      ...location,
+    },
+  });
+};
+
+const requestJsonFromUrl = (targetUrl, timeoutMs = GEO_LOOKUP_TIMEOUT_MS) =>
+  new Promise((resolve, reject) => {
+    try {
+      const parsedUrl = new URL(targetUrl);
+      const client = parsedUrl.protocol === "http:" ? http : https;
+      const request = client.request(
+        parsedUrl,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "MeraDev-Analytics/1.0",
+          },
+        },
+        (response) => {
+          const statusCode = Number(response.statusCode || 0);
+          if (statusCode < 200 || statusCode >= 300) {
+            response.resume();
+            reject(new Error(`Geo lookup failed with status ${statusCode}`));
+            return;
+          }
+
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+            if (body.length > 64 * 1024) {
+              request.destroy(new Error("Geo lookup response too large"));
+            }
+          });
+          response.on("end", () => {
+            try {
+              resolve(JSON.parse(body || "{}"));
+            } catch (_error) {
+              reject(new Error("Geo lookup response is not valid JSON"));
+            }
+          });
+        },
+      );
+
+      request.on("error", reject);
+      request.setTimeout(timeoutMs, () => {
+        request.destroy(new Error("Geo lookup timeout"));
+      });
+      request.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+
+const parseGeoLookupPayload = (payload) => {
+  if (!payload || typeof payload !== "object") return emptyGeoLocation;
+  if (payload.success === false) return emptyGeoLocation;
+
+  const countryCode = normalizeCountry(
+    pickFirstNonEmpty(payload.country_code, payload.countryCode),
+  );
+  const countryName = normalizeText(
+    pickFirstNonEmpty(payload.country_name, payload.country),
+    80,
+  );
+
+  return {
+    city: pickFirstNonEmpty(payload.city, payload.town),
+    region: pickFirstNonEmpty(
+      payload.region,
+      payload.region_name,
+      payload.state,
+      payload.province,
+      payload.regionName,
+    ),
+    country: toCountryDisplayName(countryName || countryCode),
+    timezone: normalizeTimezoneHint(
+      pickFirstNonEmpty(
+        payload?.timezone?.id,
+        payload.timezone,
+        payload.time_zone,
+        payload.timezone_name,
+      ),
+    ),
+  };
+};
+
+const fetchGeoLocationByIp = async (ip) => {
+  const safeIp = sanitizeIpCandidate(ip);
+  if (!safeIp || !net.isIP(safeIp)) return emptyGeoLocation;
+
+  const cached = readCachedGeoLocation(safeIp);
+  if (cached) return cached;
+
+  if (inFlightIpGeoLookup.has(safeIp)) {
+    return inFlightIpGeoLookup.get(safeIp);
+  }
+
+  const lookupPromise = (async () => {
+    for (const urlBuilder of GEO_LOOKUP_URL_BUILDERS) {
+      try {
+        const payload = await requestJsonFromUrl(urlBuilder(safeIp));
+        const parsed = parseGeoLookupPayload(payload);
+        if (parsed.city || parsed.region || parsed.country || parsed.timezone) {
+          writeCachedGeoLocation(safeIp, parsed);
+          return parsed;
+        }
+      } catch (_error) {
+        // Ignore provider failure and continue with the next one.
+      }
+    }
+
+    writeCachedGeoLocation(safeIp, emptyGeoLocation);
+    return emptyGeoLocation;
+  })().finally(() => {
+    inFlightIpGeoLookup.delete(safeIp);
+  });
+
+  inFlightIpGeoLookup.set(safeIp, lookupPromise);
+  return lookupPromise;
+};
+
+const guessCountryCodeFromLanguage = (language) => {
+  const safe = normalizeText(language, 40).replace(/_/g, "-");
+  if (!safe) return "";
+  const parts = safe.split("-").filter(Boolean);
+  for (let index = 1; index < parts.length; index += 1) {
+    const token = normalizeText(parts[index], 8);
+    if (/^[a-z]{2}$/i.test(token)) {
+      return token.toUpperCase();
+    }
+  }
+  return "";
+};
+
+const guessCountryCodeFromTimezone = (timezone) => {
+  const safe = normalizeTimezoneHint(timezone);
+  if (!safe) return "";
+  return normalizeCountry(timezoneCountryHintMap[safe]);
+};
+
+const inferApproxLocationFromHints = ({ metadata = {}, rawEvent = {}, timezone = "" }) => {
+  const safeTimezone = normalizeTimezoneHint(
+    pickFirstNonEmpty(
+      rawEvent?.timezone,
+      metadata?.timezone,
+      metadata?.location?.timezone,
+      timezone,
+    ),
+  );
+
+  const language = pickFirstNonEmpty(
+    metadata?.language,
+    metadata?.locale,
+    rawEvent?.language,
+  );
+
+  const countryCode =
+    guessCountryCodeFromTimezone(safeTimezone) ||
+    guessCountryCodeFromLanguage(language);
+
+  return {
+    city: "",
+    region: "",
+    country: toCountryDisplayName(countryCode),
+    timezone: safeTimezone,
+  };
+};
+
+const buildAreaLabelFromParts = ({ city, region, country }) => {
+  const safeCity = normalizeText(city, 80);
+  const safeRegion = normalizeText(region, 80);
+  const safeCountry = toCountryDisplayName(country);
+
+  if (safeCity && safeRegion && safeCountry) return `${safeCity}, ${safeRegion}, ${safeCountry}`;
+  if (safeCity && safeCountry) return `${safeCity}, ${safeCountry}`;
+  if (safeCity && safeRegion) return `${safeCity}, ${safeRegion}`;
+  if (safeCountry) return safeCountry;
+  if (safeRegion) return safeRegion;
+  if (safeCity) return safeCity;
+  return "Unknown Area";
+};
+
+const resolveLocationFromRequest = async (req, metadata = {}, rawEvent = {}) => {
+  const sourceLocation =
+    metadata?.location && typeof metadata.location === "object"
+      ? metadata.location
+      : {};
+
+  let city = pickFirstNonEmpty(
+    rawEvent?.city,
+    sourceLocation.city,
+    req.get("x-vercel-ip-city"),
+    req.get("cf-ipcity"),
+    req.get("x-appengine-city"),
+    req.get("fly-client-city"),
+    req.get("x-geo-city"),
+    req.get("x-city"),
+  );
+
+  let region = pickFirstNonEmpty(
+    rawEvent?.region,
+    sourceLocation.region,
+    req.get("x-vercel-ip-country-region"),
+    req.get("x-appengine-region"),
+    req.get("fly-client-region"),
+    req.get("x-geo-region"),
+    req.get("x-region"),
+  );
+
+  let country = toCountryDisplayName(
+    pickFirstNonEmpty(
+      rawEvent?.country,
+      sourceLocation.country,
+      req.get("x-vercel-ip-country"),
+      req.get("cf-ipcountry"),
+      req.get("x-appengine-country"),
+      req.get("fly-client-country"),
+      req.get("x-geo-country"),
+      req.get("x-country"),
+      req.get("x-country-code"),
+    ),
+  );
+
+  let timezone = normalizeTimezoneHint(
+    pickFirstNonEmpty(
+      rawEvent?.timezone,
+      metadata?.timezone,
+      sourceLocation.timezone,
+      req.get("x-time-zone"),
+      req.get("x-vercel-ip-timezone"),
+      req.get("cf-timezone"),
+    ),
+  );
+
+  if (GEO_LOOKUP_ENABLED && (!city || !region || !country)) {
+    const clientIp = extractClientIp(req);
+    if (clientIp && !isPrivateOrLoopbackIp(clientIp)) {
+      const geoByIp = await fetchGeoLocationByIp(clientIp);
+      city = city || geoByIp.city;
+      region = region || geoByIp.region;
+      country = country || toCountryDisplayName(geoByIp.country);
+      timezone = timezone || normalizeTimezoneHint(geoByIp.timezone);
+    }
+  }
+
+  if (!city || !region || !country) {
+    const hintedLocation = inferApproxLocationFromHints({
+      metadata,
+      rawEvent,
+      timezone,
+    });
+    city = city || hintedLocation.city;
+    region = region || hintedLocation.region;
+    country = country || hintedLocation.country;
+    timezone = timezone || hintedLocation.timezone;
+  }
+
+  return {
+    city,
+    region,
+    country,
+    timezone,
+    areaLabel: buildAreaLabelFromParts({ city, region, country }),
+  };
+};
+
+const getEventAreaLabel = (event = {}) => {
+  const directArea = buildAreaLabelFromParts({
+    city: event?.city,
+    region: event?.region,
+    country: event?.country,
+  });
+
+  if (directArea !== "Unknown Area") {
+    return directArea;
+  }
+
+  const metadata = toSerializableMetadata(event?.metadata);
+  const hinted = inferApproxLocationFromHints({
+    metadata,
+    rawEvent: event,
+    timezone: pickFirstNonEmpty(
+      event?.timezone,
+      metadata?.timezone,
+      metadata?.location?.timezone,
+    ),
+  });
+
+  return buildAreaLabelFromParts({
+    city: hinted.city,
+    region: hinted.region,
+    country: hinted.country,
+  });
+};
+
+const mapIncomingEvent = async (rawEvent, req) => {
   const event = rawEvent && typeof rawEvent === "object" ? rawEvent : {};
+  const metadata = toSerializableMetadata(event.metadata);
+  const location = await resolveLocationFromRequest(req, metadata, event);
   return {
     sourceApp: normalizeSourceApp(event.sourceApp),
     eventType: normalizeEventType(event.eventType),
@@ -495,7 +1067,19 @@ const mapIncomingEvent = (rawEvent, req) => {
     label: normalizeText(event.label, 240),
     sessionId: normalizeText(event.sessionId, 80),
     visitorId: normalizeText(event.visitorId, 80),
-    metadata: toSerializableMetadata(event.metadata),
+    city: location.city,
+    region: location.region,
+    country: location.country,
+    timezone: location.timezone,
+    metadata: {
+      ...metadata,
+      location: {
+        city: location.city,
+        region: location.region,
+        country: location.country,
+        timezone: location.timezone,
+      },
+    },
     occurredAt: normalizeDate(event.occurredAt),
     referrer: normalizeText(event.referrer || req.get("referer"), 320),
     userAgent: normalizeText(event.userAgent || req.get("user-agent"), 400),
@@ -515,7 +1099,9 @@ const collectFrontendEvent = async (req, res) => {
     }
 
     const cappedEvents = incoming.slice(0, 200);
-    const records = cappedEvents.map((item) => mapIncomingEvent(item, req));
+    const records = await Promise.all(
+      cappedEvents.map((item) => mapIncomingEvent(item, req)),
+    );
     await AnalyticsEvent.insertMany(records, { ordered: false });
 
     return res.status(201).json({
@@ -550,7 +1136,11 @@ const applyPathFilter = (events, pathFilter) => {
   return events.filter((event) => normalizePath(event.path) === pathFilter);
 };
 
-const buildVisitorJourney = ({ events, visitorKey }) => {
+const buildVisitorJourney = ({
+  events,
+  visitorKey,
+  partnerNameByUserId = {},
+}) => {
   const safeVisitorKey = normalizeText(visitorKey, 120);
   if (!safeVisitorKey || !events.length) {
     return null;
@@ -559,6 +1149,7 @@ const buildVisitorJourney = ({ events, visitorKey }) => {
   const sessionIds = new Set();
   const pageSet = new Set();
   const pageCounts = new Map();
+  const areaCounts = new Map();
 
   let firstSeenMs = null;
   let lastSeenMs = null;
@@ -580,6 +1171,7 @@ const buildVisitorJourney = ({ events, visitorKey }) => {
     const safePath = normalizePath(event.path) || "(no-path)";
     const occurredAtMs = normalizeDate(event.occurredAt).getTime();
     const safeSessionId = normalizeText(event.sessionId, 80);
+    const areaLabel = getEventAreaLabel(event);
 
     totalEvents += 1;
     if (eventType === "page_view") {
@@ -592,12 +1184,13 @@ const buildVisitorJourney = ({ events, visitorKey }) => {
     if (eventType === "error" || status === "failed") errors += 1;
 
     if (safeSessionId) sessionIds.add(safeSessionId);
+    areaCounts.set(areaLabel, (areaCounts.get(areaLabel) || 0) + 1);
 
     firstSeenMs = firstSeenMs === null ? occurredAtMs : Math.min(firstSeenMs, occurredAtMs);
     lastSeenMs = lastSeenMs === null ? occurredAtMs : Math.max(lastSeenMs, occurredAtMs);
 
     if (activities.length < MAX_VISITOR_JOURNEY_ACTIVITIES) {
-      const activity = buildActivityEntry(event);
+      const activity = buildActivityEntry(event, { partnerNameByUserId });
       if (activity) activities.push(activity);
     }
   });
@@ -619,7 +1212,11 @@ const buildVisitorJourney = ({ events, visitorKey }) => {
     pageSequence.push({
       occurredAt: normalizeDate(event.occurredAt).toISOString(),
       path: safePath,
-      pageLabel: getPathDescriptor(safePath, metadata).label,
+      pageLabel: getPathDescriptor(
+        safePath,
+        metadata,
+        { partnerNameByUserId },
+      ).label,
     });
   });
 
@@ -636,6 +1233,8 @@ const buildVisitorJourney = ({ events, visitorKey }) => {
     errors,
     sessionCount: sessionIds.size,
     uniquePages: pageSet.size,
+    primaryArea: toTopList(areaCounts.entries(), "area", 1)[0]?.area || "Unknown Area",
+    topAreas: toTopList(areaCounts.entries(), "area", 5),
     topPages: toTopList(pageCounts.entries(), "path", 12),
     pageSequence,
     activities,
@@ -682,7 +1281,7 @@ const resolveDashboardRequest = (query = {}) => {
   };
 };
 
-const summarizeAnalytics = ({
+const summarizeAnalytics = async ({
   events,
   startAt,
   endAt,
@@ -690,6 +1289,7 @@ const summarizeAnalytics = ({
   granularity,
   baseEventsForFilters,
   appliedPathFilter,
+  partnerNameByUserId = {},
 }) => {
   const sessionSet = new Set();
   const visitorSet = new Set();
@@ -708,6 +1308,7 @@ const summarizeAnalytics = ({
   const topPagesMap = new Map();
   const topActionsMap = new Map();
   const topApiMap = new Map();
+  const topAreasMap = new Map();
   const pageTrafficMap = new Map();
   const visitorMap = new Map();
 
@@ -744,6 +1345,7 @@ const summarizeAnalytics = ({
     const safeEndpoint = normalizeText(event?.metadata?.endpoint, 220);
     const safeSessionId = normalizeText(event.sessionId, 80);
     const audienceId = deriveVisitorKey(event);
+    const areaLabel = getEventAreaLabel(event);
 
     if (eventType === "page_view") pageViews += 1;
     if (eventType === "click") clicks += 1;
@@ -767,6 +1369,7 @@ const summarizeAnalytics = ({
       topActionsMap.set(safeAction, (topActionsMap.get(safeAction) || 0) + 1);
     }
     if (safeEndpoint) topApiMap.set(safeEndpoint, (topApiMap.get(safeEndpoint) || 0) + 1);
+    topAreasMap.set(areaLabel, (topAreasMap.get(areaLabel) || 0) + 1);
 
     eventTypeCounts.set(eventType, (eventTypeCounts.get(eventType) || 0) + 1);
     statusCounts.set(status, (statusCounts.get(status) || 0) + 1);
@@ -823,6 +1426,7 @@ const summarizeAnalytics = ({
         errors: 0,
         sessionIds: new Set(),
         pageCounts: new Map(),
+        areaCounts: new Map(),
         recentActivities: [],
         lastActivity: null,
       };
@@ -838,14 +1442,15 @@ const summarizeAnalytics = ({
       if (eventType === "form_submit") visitor.formSubmissions += 1;
       if (eventType === "error" || status === "failed") visitor.errors += 1;
       if (safeSessionId) visitor.sessionIds.add(safeSessionId);
+      visitor.areaCounts.set(areaLabel, (visitor.areaCounts.get(areaLabel) || 0) + 1);
 
       if (visitor.recentActivities.length < MAX_VISITOR_PREVIEW_ACTIVITIES) {
-        const activity = buildActivityEntry(event);
-        if (activity) {
-          visitor.recentActivities.push(activity);
-          if (!visitor.lastActivity) {
-            visitor.lastActivity = activity;
-          }
+          const activity = buildActivityEntry(event, { partnerNameByUserId });
+          if (activity) {
+            visitor.recentActivities.push(activity);
+            if (!visitor.lastActivity) {
+              visitor.lastActivity = activity;
+            }
         }
       }
 
@@ -921,6 +1526,8 @@ const summarizeAnalytics = ({
       errors: visitor.errors,
       sessionCount: visitor.sessionIds.size,
       uniquePages: visitor.pageCounts.size,
+      primaryArea: toTopList(visitor.areaCounts.entries(), "area", 1)[0]?.area || "Unknown Area",
+      topAreas: toTopList(visitor.areaCounts.entries(), "area", 3),
       topPages: toTopList(visitor.pageCounts.entries(), "path", 4),
       lastActivity: visitor.lastActivity,
       recentActivities: visitor.recentActivities,
@@ -972,6 +1579,7 @@ const summarizeAnalytics = ({
     timeline,
     topPages: toTopList(topPagesMap.entries(), "path", 12),
     topActions: toTopList(topActionsMap.entries(), "action", 12),
+    topAreas: toTopList(topAreasMap.entries(), "area", 12),
     topApiEndpoints: toTopList(topApiMap.entries(), "endpoint", 12),
     eventBreakdown,
     statusBreakdown,
@@ -991,11 +1599,9 @@ const summarizeAnalytics = ({
 };
 
 const getOwnerAnalyticsDashboard = async (req, res) => {
-  if (!hasOwnerAccess(req)) {
-    return res.status(403).json({ message: "Only owner can access analytics dashboard" });
-  }
-
   try {
+    if (!(await ensureAnalyticsAccess(req, res))) return;
+
     const {
       timeZone,
       eventTypeFilter,
@@ -1014,14 +1620,15 @@ const getOwnerAnalyticsDashboard = async (req, res) => {
     });
 
     const baseEvents = await AnalyticsEvent.find(mongoFilter)
-      .select("eventType status path action label metadata sessionId visitorId occurredAt sourceApp")
+      .select("eventType status path action label metadata sessionId visitorId city region country timezone occurredAt sourceApp")
       .sort({ occurredAt: -1 })
       .limit(MAX_QUERY_LIMIT)
       .lean();
 
     const filteredEvents = applyPathFilter(baseEvents, pathFilter);
 
-    const analytics = summarizeAnalytics({
+    const partnerNameByUserId = await resolvePartnerNameByUserId(filteredEvents);
+    const analytics = await summarizeAnalytics({
       events: filteredEvents,
       startAt,
       endAt,
@@ -1029,6 +1636,7 @@ const getOwnerAnalyticsDashboard = async (req, res) => {
       granularity,
       baseEventsForFilters: baseEvents,
       appliedPathFilter: pathFilter,
+      partnerNameByUserId,
     });
 
     return res.json({ analytics });
@@ -1039,11 +1647,9 @@ const getOwnerAnalyticsDashboard = async (req, res) => {
 };
 
 const getOwnerVisitorJourney = async (req, res) => {
-  if (!hasOwnerAccess(req)) {
-    return res.status(403).json({ message: "Only owner can access analytics dashboard" });
-  }
-
   try {
+    if (!(await ensureAnalyticsAccess(req, res))) return;
+
     const visitorKey = normalizeText(req.query?.visitor, 120);
     if (!visitorKey) {
       return res.status(400).json({ message: "visitor query is required" });
@@ -1067,7 +1673,7 @@ const getOwnerVisitorJourney = async (req, res) => {
     });
 
     const baseEvents = await AnalyticsEvent.find(mongoFilter)
-      .select("eventType status path action label metadata sessionId visitorId occurredAt sourceApp")
+      .select("eventType status path action label metadata sessionId visitorId city region country timezone occurredAt sourceApp")
       .sort({ occurredAt: -1 })
       .limit(MAX_QUERY_LIMIT)
       .lean();
@@ -1075,9 +1681,11 @@ const getOwnerVisitorJourney = async (req, res) => {
     const pathFilteredEvents = applyPathFilter(baseEvents, pathFilter);
     const visitorEvents = pathFilteredEvents.filter((event) => deriveVisitorKey(event) === visitorKey);
 
+    const partnerNameByUserId = await resolvePartnerNameByUserId(visitorEvents);
     const visitorJourney = buildVisitorJourney({
       events: visitorEvents,
       visitorKey,
+      partnerNameByUserId,
     });
 
     return res.json({

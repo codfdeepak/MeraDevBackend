@@ -66,6 +66,30 @@ const analyticsEventSchema = new mongoose.Schema(
       maxlength: 80,
       default: "",
     },
+    city: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+      default: "",
+    },
+    region: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+      default: "",
+    },
+    country: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+      default: "",
+    },
+    timezone: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+      default: "",
+    },
     metadata: {
       type: mongoose.Schema.Types.Mixed,
       default: {},
@@ -95,5 +119,7 @@ analyticsEventSchema.index({ occurredAt: -1 });
 analyticsEventSchema.index({ eventType: 1, occurredAt: -1 });
 analyticsEventSchema.index({ path: 1, occurredAt: -1 });
 analyticsEventSchema.index({ sourceApp: 1, occurredAt: -1 });
+analyticsEventSchema.index({ country: 1, occurredAt: -1 });
+analyticsEventSchema.index({ city: 1, occurredAt: -1 });
 
 module.exports = mongoose.model("AnalyticsEvent", analyticsEventSchema);

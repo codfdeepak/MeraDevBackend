@@ -37,6 +37,12 @@ const userSchema = new mongoose.Schema(
       enum: ['pending', 'approved', 'rejected'],
       default: 'pending',
     },
+    featureAccess: {
+      webAnalytics: {
+        type: Boolean,
+        default: false,
+      },
+    },
   },
   { timestamps: true },
 );

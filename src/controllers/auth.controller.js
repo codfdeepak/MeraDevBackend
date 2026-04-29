@@ -18,6 +18,11 @@ const getApprovalStatus = (user) => {
   if (isOwnerUser(user)) return "approved";
   return user?.approvalStatus || "approved";
 };
+const getFeatureAccess = (user) => ({
+  webAnalytics: isOwnerUser(user)
+    ? true
+    : Boolean(user?.featureAccess?.webAnalytics),
+});
 
 const sanitizeUser = (user) => ({
   id: user._id,
@@ -28,6 +33,7 @@ const sanitizeUser = (user) => ({
   role: getRole(user),
   isActive: user.isActive !== false,
   approvalStatus: getApprovalStatus(user),
+  featureAccess: getFeatureAccess(user),
   createdAt: user.createdAt,
 });
 
@@ -68,6 +74,9 @@ const register = async (req, res) => {
       company,
       role: normalizedRole,
       approvalStatus,
+      featureAccess: {
+        webAnalytics: normalizedRole === "owner",
+      },
     });
 
     if (approvalStatus !== "approved") {
@@ -251,7 +260,7 @@ const listUsers = async (req, res) => {
 
     const users = await User.find({})
       .select(
-        "fullName mobile email role isActive approvalStatus createdAt updatedAt",
+        "fullName mobile email role isActive approvalStatus featureAccess createdAt updatedAt",
       )
       .sort({ createdAt: -1 });
 
@@ -334,6 +343,37 @@ const updateUserApproval = async (req, res) => {
   }
 };
 
+const updateUserFeatureAccess = async (req, res) => {
+  try {
+    if (denyIfNotOwner(req, res)) return;
+
+    const { userId } = req.params;
+    const { webAnalytics } = req.body || {};
+
+    if (typeof webAnalytics !== "boolean") {
+      return res
+        .status(400)
+        .json({ message: "webAnalytics must be boolean" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (String(user.role || "").toLowerCase() === "owner") {
+      return res
+        .status(400)
+        .json({ message: "Owner feature access cannot be changed" });
+    }
+
+    user.set("featureAccess.webAnalytics", webAnalytics);
+    await user.save();
+
+    return res.json({ user: sanitizeUser(user) });
+  } catch (err) {
+    console.error("Update user feature access error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+};
+
 const resetUserPassword = async (req, res) => {
   try {
     if (denyIfNotOwner(req, res)) return;
@@ -406,6 +446,7 @@ module.exports = {
   listUsers,
   updateUserStatus,
   updateUserApproval,
+  updateUserFeatureAccess,
   resetUserPassword,
   deleteUser,
 };
