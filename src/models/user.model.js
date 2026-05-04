@@ -42,6 +42,15 @@ const userSchema = new mongoose.Schema(
         type: Boolean,
         default: false,
       },
+      partnerPageVisible: {
+        type: Boolean,
+        default: true,
+      },
+      partnerCategory: {
+        type: String,
+        enum: ["leadership", "tech", "marketingBusiness", "creativeDesign"],
+        default: null,
+      },
     },
   },
   { timestamps: true },

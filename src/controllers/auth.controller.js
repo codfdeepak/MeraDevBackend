@@ -14,6 +14,16 @@ const normalizeRole = (role) => {
 
 const getRole = (user) => normalizeRole(user?.role);
 const isOwnerUser = (user) => getRole(user) === "owner";
+const PARTNER_CATEGORY_VALUES = [
+  "leadership",
+  "tech",
+  "marketingBusiness",
+  "creativeDesign",
+];
+const normalizePartnerCategory = (value) => {
+  const category = String(value || "").trim();
+  return PARTNER_CATEGORY_VALUES.includes(category) ? category : null;
+};
 const getApprovalStatus = (user) => {
   if (isOwnerUser(user)) return "approved";
   return user?.approvalStatus || "approved";
@@ -22,6 +32,12 @@ const getFeatureAccess = (user) => ({
   webAnalytics: isOwnerUser(user)
     ? true
     : Boolean(user?.featureAccess?.webAnalytics),
+  partnerPageVisible: isOwnerUser(user)
+    ? true
+    : user?.featureAccess?.partnerPageVisible !== false,
+  partnerCategory: isOwnerUser(user)
+    ? "leadership"
+    : normalizePartnerCategory(user?.featureAccess?.partnerCategory),
 });
 
 const sanitizeUser = (user) => ({
@@ -76,6 +92,8 @@ const register = async (req, res) => {
       approvalStatus,
       featureAccess: {
         webAnalytics: normalizedRole === "owner",
+        partnerPageVisible: true,
+        partnerCategory: normalizedRole === "owner" ? "leadership" : null,
       },
     });
 
@@ -348,12 +366,30 @@ const updateUserFeatureAccess = async (req, res) => {
     if (denyIfNotOwner(req, res)) return;
 
     const { userId } = req.params;
-    const { webAnalytics } = req.body || {};
+    const { webAnalytics, partnerPageVisible, partnerCategory } = req.body || {};
+    const hasWebAnalyticsUpdate = typeof webAnalytics === "boolean";
+    const hasPartnerVisibilityUpdate = typeof partnerPageVisible === "boolean";
+    const hasPartnerCategoryUpdate = typeof partnerCategory === "string";
+    const normalizedPartnerCategory = hasPartnerCategoryUpdate
+      ? normalizePartnerCategory(partnerCategory)
+      : null;
 
-    if (typeof webAnalytics !== "boolean") {
-      return res
-        .status(400)
-        .json({ message: "webAnalytics must be boolean" });
+    if (
+      !hasWebAnalyticsUpdate &&
+      !hasPartnerVisibilityUpdate &&
+      !hasPartnerCategoryUpdate
+    ) {
+      return res.status(400).json({
+        message:
+          "Provide at least one feature value: webAnalytics, partnerPageVisible, or partnerCategory",
+      });
+    }
+
+    if (hasPartnerCategoryUpdate && !normalizedPartnerCategory) {
+      return res.status(400).json({
+        message:
+          "partnerCategory must be one of: leadership, tech, marketingBusiness, creativeDesign",
+      });
     }
 
     const user = await User.findById(userId);
@@ -364,7 +400,15 @@ const updateUserFeatureAccess = async (req, res) => {
         .json({ message: "Owner feature access cannot be changed" });
     }
 
-    user.set("featureAccess.webAnalytics", webAnalytics);
+    if (hasWebAnalyticsUpdate) {
+      user.set("featureAccess.webAnalytics", webAnalytics);
+    }
+    if (hasPartnerVisibilityUpdate) {
+      user.set("featureAccess.partnerPageVisible", partnerPageVisible);
+    }
+    if (hasPartnerCategoryUpdate) {
+      user.set("featureAccess.partnerCategory", normalizedPartnerCategory);
+    }
     await user.save();
 
     return res.json({ user: sanitizeUser(user) });

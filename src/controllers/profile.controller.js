@@ -1,4 +1,10 @@
 const Profile = require('../models/profile.model')
+const PARTNER_CATEGORY_VALUES = new Set([
+  'leadership',
+  'tech',
+  'marketingBusiness',
+  'creativeDesign',
+])
 
 // helper to ensure we never overwrite the user field from the client
 const sanitizeIncoming = (body) => {
@@ -59,19 +65,34 @@ const getPartnersProfiles = async (_req, res) => {
   try {
     const partnerDocs = await Profile.find({})
       .select('user about.headline about.avatar skills totalExperienceYears')
-      .populate('user', 'fullName role')
+      .populate({
+        path: 'user',
+        select: 'fullName role featureAccess.partnerCategory',
+        match: {
+          'featureAccess.partnerPageVisible': { $ne: false },
+        },
+      })
       .sort({ updatedAt: -1 })
 
-    const partners = partnerDocs.map((doc) => {
-      const profile = doc.toObject()
-      const role = String(profile?.user?.role || 'partner').toLowerCase()
+    const partners = partnerDocs
+      .filter((doc) => doc.user)
+      .map((doc) => {
+        const profile = doc.toObject()
+        const role = String(profile?.user?.role || 'partner').toLowerCase()
+        const partnerCategoryRaw = String(
+          profile?.user?.featureAccess?.partnerCategory || '',
+        ).trim()
+        const partnerCategory = PARTNER_CATEGORY_VALUES.has(partnerCategoryRaw)
+          ? partnerCategoryRaw
+          : null
 
-      return {
-        ...profile,
-        role,
-        isOwner: role === 'admin' || role === 'owner',
-      }
-    })
+        return {
+          ...profile,
+          role,
+          isOwner: role === 'admin' || role === 'owner',
+          partnerCategory,
+        }
+      })
 
     return res.json({ partners })
   } catch (err) {
