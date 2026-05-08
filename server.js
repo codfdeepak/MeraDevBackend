@@ -20,23 +20,43 @@ const normalizeOrigin = (value = "") =>
     .trim()
     .replace(/^['"]|['"]$/g, "")
     .replace(/\/$/, "");
-const configuredOrigins = `${process.env.ALLOWED_ORIGINS || ""},${process.env.WEBSITE_URL || ""}`
-  .split(",")
-  .map(normalizeOrigin)
-  .filter(Boolean);
 
-const defaultAllowedOrigins = [
+const buildOriginsWithProtocolVariants = (hostname) => [
+  `https://${hostname}`,
+  `http://${hostname}`,
+];
+
+const configuredOrigins =
+  `${process.env.ALLOWED_ORIGINS || ""},${process.env.WEBSITE_URL || ""}`
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean)
+    .filter((origin) => origin !== "*");
+
+const localAllowedOrigins = [
   "http://localhost:5173",
+  "http://127.0.0.1:5173",
   "http://localhost:5174",
+  "http://127.0.0.1:5174",
   "http://localhost:5175",
+  "http://127.0.0.1:5175",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
 ];
 
-const allowAllOrigins = configuredOrigins.includes("*");
+const liveAllowedOrigins = [
+  ...buildOriginsWithProtocolVariants("meradevtechnologies.com"),
+  ...buildOriginsWithProtocolVariants("www.meradevtechnologies.com"),
+  ...buildOriginsWithProtocolVariants("admin.meradevtechnologies.com"),
+  ...buildOriginsWithProtocolVariants("www.admin.meradevtechnologies.com"),
+];
+
 const allowedOrigins = new Set([
-  ...defaultAllowedOrigins.map(normalizeOrigin),
-  ...configuredOrigins.filter((origin) => origin !== "*"),
+  ...localAllowedOrigins.map(normalizeOrigin),
+  ...liveAllowedOrigins.map(normalizeOrigin),
+  ...configuredOrigins,
 ]);
 
 const corsOptions = {
@@ -47,7 +67,7 @@ const corsOptions = {
     }
 
     const normalizedRequestOrigin = normalizeOrigin(origin);
-    if (allowAllOrigins || allowedOrigins.has(normalizedRequestOrigin)) {
+    if (allowedOrigins.has(normalizedRequestOrigin)) {
       callback(null, true);
       return;
     }
@@ -61,7 +81,7 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 // Allow slightly larger JSON payloads to support gallery/base64 uploads from admin
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: "15mb" }));
 
 app.get("/", (_req, res) => {
   res.json({ status: "ok", message: "Backend is live " });
@@ -74,6 +94,20 @@ app.use("/api/consultations", consultationRoutes);
 app.use("/api/hero", heroRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/analytics", analyticsRoutes);
+
+app.use((_req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+app.use((err, _req, res, _next) => {
+  if (err?.message?.startsWith("CORS blocked for origin:")) {
+    res.status(403).json({ message: err.message });
+    return;
+  }
+
+  console.error("Unhandled server error", err);
+  res.status(500).json({ message: "Internal server error" });
+});
 
 const PORT = process.env.PORT || 5000;
 
